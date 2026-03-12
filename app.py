@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import time
 import json
+import mimetypes
 
 # Page configuration
 st.set_page_config(page_title="Reverb Cloner PRO", page_icon="🎸", layout="centered")
@@ -26,6 +27,31 @@ def extract_listing_id(url):
     except Exception as e:
         st.error(f"Error parsing URL: {e}")
         return None
+
+def parse_listing_urls(raw_input):
+    """Parse multiple listing URLs (newline/comma/space separated)"""
+    if not raw_input:
+        return []
+
+    separators_normalized = raw_input.replace(",", "\n").replace(";", "\n")
+    urls = []
+    for line in separators_normalized.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        # Handle accidental space-separated URLs on one line
+        parts = cleaned.split()
+        urls.extend([p for p in parts if p.startswith("http")])
+
+    # De-duplicate while preserving order
+    unique_urls = []
+    seen = set()
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+
+    return unique_urls
 
 def get_listing(api_key, listing_id):
     """Fetch original listing data"""
@@ -272,6 +298,29 @@ def create_listing(api_key, original_listing, shipping_profile_id, price_multipl
         st.error(f"Connection error: {e}")
         return None
 
+def wait_for_listing_ready(api_key, listing_id, max_wait_seconds=120):
+    """Poll listing endpoint until listing is available for photo upload."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept-Version": "3.0",
+    }
+
+    start = time.time()
+    while time.time() - start < max_wait_seconds:
+        try:
+            check_response = requests.get(
+                f"{API_BASE}/listings/{listing_id}",
+                headers=headers,
+                timeout=15,
+            )
+            if check_response.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(5)
+
+    return False
+
 def upload_images(api_key, listing_id, image_paths):
     """Upload images to the listing - FINAL VERSION with multiple endpoints"""
     if not image_paths:
@@ -283,13 +332,8 @@ def upload_images(api_key, listing_id, image_paths):
         "Accept-Version": "3.0",
     }
 
-    # First, check if listing exists
-    check_response = requests.get(
-        f"{API_BASE}/listings/{listing_id}",
-        headers=headers
-    )
-    
-    if check_response.status_code != 200:
+    # First, check if listing exists and is ready
+    if not wait_for_listing_ready(api_key, listing_id):
         st.error("❌ Cannot access the listing. It may not be ready yet.")
         return False
     
@@ -323,32 +367,40 @@ def upload_images(api_key, listing_id, image_paths):
             
             uploaded = False
             
+            mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+
             # Try each endpoint
             for endpoint in endpoints_to_try:
                 if uploaded:
                     break
                     
                 with open(image_path, "rb") as img_file:
-                    files = {
-                        'photo': (f'image_{i}.jpg', img_file, 'image/jpeg')
-                    }
+                    files_variants = [
+                        {"photo": (os.path.basename(image_path), img_file, mime_type)},
+                        {"file": (os.path.basename(image_path), img_file, mime_type)},
+                        {"image": (os.path.basename(image_path), img_file, mime_type)},
+                    ]
                     
-                    try:
-                        upload_response = requests.post(
-                            endpoint,
-                            headers=headers,
-                            files=files,
-                            timeout=30
-                        )
-                        
-                        if upload_response.status_code in [200, 201, 202, 204]:
-                            successful_uploads += 1
-                            st.write(f"✅ Uploaded image {i+1}")
-                            uploaded = True
-                        else:
-                            st.write(f"Endpoint {endpoint} returned {upload_response.status_code}")
-                    except:
-                        continue
+                    for files in files_variants:
+                        try:
+                            img_file.seek(0)
+                            upload_response = requests.post(
+                                endpoint,
+                                headers=headers,
+                                files=files,
+                                timeout=45
+                            )
+
+                            if upload_response.status_code in [200, 201, 202, 204]:
+                                successful_uploads += 1
+                                st.write(f"✅ Uploaded image {i+1}")
+                                uploaded = True
+                                break
+                        except Exception:
+                            continue
+
+                    if not uploaded:
+                        st.write(f"Endpoint {endpoint} upload attempt failed for image {i+1}")
             
             if not uploaded:
                 st.write(f"❌ Failed to upload image {i+1} with all endpoints")
@@ -443,7 +495,11 @@ api_key = st.text_input("🔑 API Key", type="password", help="Enter your Reverb
 
 shipping_profile_id = st.text_input("📦 Shipping Profile ID", help="Enter your Shipping Profile ID")
 
-listing_url = st.text_input("🔗 Listing URL", help="Paste the Reverb listing URL you want to clone")
+listing_urls_input = st.text_area(
+    "🔗 Listing URL(s)",
+    help="Paste one or more Reverb listing URLs (newline, comma, or space separated).",
+    height=140,
+)
 
 # Clone button
 if st.button("🚀 Start Cloning", type="primary", use_container_width=True):
@@ -457,74 +513,90 @@ if st.button("🚀 Start Cloning", type="primary", use_container_width=True):
         st.error("❌ Please enter your Shipping Profile ID")
         st.stop()
     
-    if not listing_url:
-        st.error("❌ Please enter a Listing URL")
+    listing_urls = parse_listing_urls(listing_urls_input)
+    if not listing_urls:
+        st.error("❌ Please enter at least one valid Listing URL")
+        st.stop()
+
+    if len(listing_urls) > 200:
+        st.error("❌ Please process up to 200 listings per run to avoid API throttling")
         st.stop()
     
     # Start cloning process
     with st.spinner("Processing your request..."):
         
-        # Extract listing ID
-        listing_id = extract_listing_id(listing_url)
-        
-        if not listing_id:
-            st.error("❌ Invalid URL format")
-            st.stop()
-        
-        st.info(f"📋 Original Listing ID: {listing_id}")
-        
-        # Fetch original listing
-        original_listing = get_listing(api_key, listing_id)
-        
-        if not original_listing:
-            st.stop()
-        
-        # Download images
-        st.info("📥 Downloading images...")
-        image_paths = download_images(original_listing)
-        st.success(f"✅ Downloaded {len(image_paths)} images")
-        
-        # Create new listing
-        st.info("📝 Creating new listing...")
-        new_listing_id = create_listing(api_key, original_listing, shipping_profile_id, price_multiplier)
-        
-        if not new_listing_id:
-            # Cleanup on failure
-            cleanup_images(image_paths, keep_images=True)
-            st.stop()
-        
-        st.success(f"✅ Created new listing with ID: {new_listing_id}")
-        
-        # Wait for listing to be ready
-        st.write("⏳ Waiting 15 seconds for listing to be ready...")
-        time.sleep(15)
-        
-        # Upload images
-        if image_paths:
-            st.info("📤 Uploading images...")
-            upload_success = upload_images(api_key, new_listing_id, image_paths)
-            
-            if upload_success:
-                st.success("✅ Images uploaded successfully")
-            else:
-                st.warning("⚠️ Some images failed to upload")
-        
-        # Publish the listing if auto-publish is enabled
-        if auto_publish and new_listing_id:
-            st.info("📢 Publishing listing...")
-            publish_listing(api_key, new_listing_id)
-        
-        # Cleanup
-        cleanup_images(image_paths, keep_images)
-        
-        # Success message
+        st.info(f"📦 Processing {len(listing_urls)} listing URL(s)")
+        run_progress = st.progress(0)
+        results = []
+
+        for index, listing_url in enumerate(listing_urls, start=1):
+            st.markdown("---")
+            st.subheader(f"Listing {index}/{len(listing_urls)}")
+
+            listing_id = extract_listing_id(listing_url)
+
+            if not listing_id:
+                st.error(f"❌ Invalid URL format: {listing_url}")
+                results.append({"source": listing_url, "new_id": None, "status": "failed_invalid_url"})
+                run_progress.progress(index / len(listing_urls))
+                continue
+
+            st.info(f"📋 Original Listing ID: {listing_id}")
+
+            original_listing = get_listing(api_key, listing_id)
+            if not original_listing:
+                results.append({"source": listing_url, "new_id": None, "status": "failed_fetch"})
+                run_progress.progress(index / len(listing_urls))
+                continue
+
+            st.info("📥 Downloading images...")
+            image_paths = download_images(original_listing)
+            st.success(f"✅ Downloaded {len(image_paths)} images")
+
+            st.info("📝 Creating new listing...")
+            new_listing_id = create_listing(api_key, original_listing, shipping_profile_id, price_multiplier)
+
+            if not new_listing_id:
+                cleanup_images(image_paths, keep_images=True)
+                results.append({"source": listing_url, "new_id": None, "status": "failed_create"})
+                run_progress.progress(index / len(listing_urls))
+                continue
+
+            st.success(f"✅ Created new listing with ID: {new_listing_id}")
+
+            if image_paths:
+                st.info("📤 Uploading images...")
+                upload_success = upload_images(api_key, new_listing_id, image_paths)
+
+                if upload_success:
+                    st.success("✅ Images uploaded successfully")
+                else:
+                    st.warning("⚠️ Some images failed to upload")
+
+            if auto_publish and new_listing_id:
+                st.info("📢 Publishing listing...")
+                publish_listing(api_key, new_listing_id)
+
+            cleanup_images(image_paths, keep_images)
+            results.append({"source": listing_url, "new_id": new_listing_id, "status": "success"})
+
+            # Reduce chance of Reverb API throttling on large batches
+            if index < len(listing_urls):
+                time.sleep(2)
+
+            run_progress.progress(index / len(listing_urls))
+
+        success_count = len([r for r in results if r["status"] == "success"])
         st.balloons()
-        st.success("🎉 Clone completed successfully!")
-        
-        # Show link to new listing
-        if new_listing_id:
-            st.markdown(f"🔗 [View your new listing](https://reverb.com/item/{new_listing_id})")
-            st.markdown(f"✏️ [Edit your listing](https://reverb.com/item/{new_listing_id}/edit)")
+        st.success(f"🎉 Clone run completed: {success_count}/{len(listing_urls)} success")
+
+        st.subheader("Run Summary")
+        st.table(results)
+
+        for item in results:
+            if item["new_id"]:
+                st.markdown(f"🔗 [View listing {item['new_id']}](https://reverb.com/item/{item['new_id']})")
+                st.markdown(f"✏️ [Edit listing {item['new_id']}](https://reverb.com/item/{item['new_id']}/edit)")
 
 # Add footer
 st.markdown("---")
